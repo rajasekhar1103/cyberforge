@@ -1,0 +1,119 @@
+rules:
+- rule_id: AUTH-001
+  name: Repeated admin login failure
+  description: FortiGate event system login failure by admin
+  category: authentication
+  enabled: true
+  severity: medium
+  log_types: [event|system]
+  conditions:
+  - {field: action, op: eq, value: login}
+  - {field: status, op: eq, value: failed}
+  evidence_fields: [srcip, user, status, reason, msg]
+  confidence: medium
+  mitre_techniques: [T1110]
+  tags: [auth]
+- rule_id: IPS-001
+  name: IPS signature detection
+  category: intrusion_prevention
+  enabled: true
+  severity: high
+  log_types: [utm|ips]
+  conditions:
+  - {field: action, op: in, value: [dropped, blocked, detected]}
+  evidence_fields: [srcip, dstip, attack, severity, action]
+  description: IPS signature detection event
+  confidence: medium
+  mitre_techniques: []
+  tags: [ips]
+- rule_id: IPS-002
+  name: High severity IPS
+  category: intrusion_prevention
+  enabled: true
+  severity: critical
+  log_types: [utm|ips]
+  conditions:
+  - {field: severity, op: in, value: [critical, high]}
+  evidence_fields: [srcip, dstip, attack, severity]
+  description: High/critical severity IPS event
+  confidence: medium
+  mitre_techniques: []
+  tags: [ips]
+- rule_id: AV-001
+  name: Antivirus detection
+  category: malware
+  enabled: true
+  severity: high
+  log_types: [utm|virus]
+  conditions:
+  - {field: action, op: exists}
+  evidence_fields: [srcip, dstip, virus, filename]
+  description: Antivirus detection event
+  confidence: medium
+  mitre_techniques: []
+  tags: [malware]
+- rule_id: DNS-001
+  name: DNS blocked query
+  category: dns
+  enabled: true
+  severity: medium
+  log_types: [utm|dns]
+  conditions:
+  - {field: action, op: in, value: [block, blocked, deny]}
+  evidence_fields: [srcip, dstip, hostname, action]
+  description: DNS request blocked by policy
+  confidence: low
+  mitre_techniques: []
+  tags: [dns]
+- rule_id: WEB-001
+  name: Web filter block
+  category: web_filtering
+  enabled: true
+  severity: medium
+  log_types: [utm|webfilter]
+  conditions:
+  - {field: action, op: in, value: [block, blocked, deny]}
+  evidence_fields: [srcip, dstip, hostname, catdesc, action]
+  description: Web filtering blocked request
+  confidence: low
+  mitre_techniques: []
+  tags: [web]
+- rule_id: APP-001
+  name: Application control block
+  category: application_control
+  enabled: true
+  severity: medium
+  log_types: [utm|app-ctrl]
+  conditions:
+  - {field: action, op: in, value: [block, blocked, deny]}
+  evidence_fields: [srcip, dstip, app, action]
+  description: Application control blocked app
+  confidence: low
+  mitre_techniques: []
+  tags: [app]
+- rule_id: NET-001
+  name: Denied traffic
+  category: network_traffic
+  enabled: true
+  severity: low
+  log_types: [traffic|forward]
+  conditions:
+  - {field: action, op: in, value: [deny, denied, drop, dropped]}
+  evidence_fields: [srcip, dstip, dstport, proto, action]
+  description: Denied forward traffic
+  confidence: low
+  mitre_techniques: []
+  tags: [network]
+- rule_id: VPN-001
+  name: VPN authentication failure
+  category: vpn
+  enabled: true
+  severity: medium
+  log_types: [event|vpn]
+  conditions:
+  - {field: status, op: eq, value: failed}
+  evidence_fields: [srcip, user, status, msg]
+  description: VPN authentication failure
+  confidence: medium
+  mitre_techniques: [T1133]
+  tags: [vpn]

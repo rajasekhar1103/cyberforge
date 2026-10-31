@@ -1,0 +1,3 @@
+# Incident Schema
+
+Fields: incident_id,title,description,severity,confidence,first_observed,last_observed,detection_count,unique_source_events,related_srcips,related_dstips,related_usernames,related_hosts,detection_ids,correlation_reasons,evidence_refs,status.

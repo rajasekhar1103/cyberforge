@@ -1,0 +1,49 @@
+field,count,percentage,types,examples,missing
+action,1000,100.0,string,pass | accept | login,0
+app,356,35.6,string,Discord | SCP | HTTPS,644
+appcat,356,35.6,string,Email | Collaboration | P2P,644
+apprisk,356,35.6,string,elevated | medium | low,644
+attack,27,2.7,string,Apache.security.DDoS-protection | Citrix.ADC.Gateway.Directory.Traversal | Splunk.security.TSI,973
+attackid,27,2.7,int,45716 | 42667 | 45852,973
+catdesc,45,4.5,string,Phishing Attempts | Spyware | Phishing Campaigns,955
+date,1000,100.0,string,2026-10-23,0
+devid,1000,100.0,string,FGT60FTK00000000,0
+devname,1000,100.0,string,FGT60FTK00000000,0
+dstcountry,940,94.0,string,Ireland | Singapore | Brazil,60
+dstintf,925,92.5,string,wan1 | mgmt | internal2,75
+dstintfrole,940,94.0,string,wan | lan | dmz,60
+dstip,940,94.0,string,11.113.232.73 | 47.123.169.124 | 71.38.6.121,60
+dstport,778,77.8,int,53 | 443 | 4937,222
+duration,631,63.1,int,274 | 257 | 261,369
+eventtime,1000,100.0,int,1792745306000000000 | 1792745306282232000 | 1792745306423348000,0
+hostname,95,9.5,string,nytimes.com | aljazeera.com | mailchimp.com,905
+level,1000,100.0,string,information | notice | alert,0
+logdesc,198,19.8,string,Admin login failed | DHCP statistics | HA device status,802
+logid,1000,100.0,int,1501054600 | 0000000013 | 0100032002,0
+method,147,14.7,string,https | ssh,853
+msg,222,22.2,string,Administrator admin login failed from https(209.50.167.232) because of invalid user name | Administrator chethan login failed from https(94.154.43.56) because of invalid user name | Administrator admin login failed from https(104.207.42.233) because of invalid user name,778
+policyid,778,77.8,int,20 | 4 | 5,222
+proto,940,94.0,int,17 | 6 | 1,60
+rcvdbyte,631,63.1,int,35730 | 82020 | 11685,369
+rcvdpkt,631,63.1,int,26 | 59 | 9,369
+reason,147,14.7,string,name_invalid,853
+sentbyte,631,63.1,int,17865 | 20505 | 3895,369
+sentpkt,631,63.1,int,14 | 16 | 3,369
+service,778,77.8,string,DNS | RDP | HTTPS,222
+sessionid,778,77.8,int,235524450 | 1040491107 | 1309353623,222
+severity,27,2.7,string,critical | medium | high,973
+srccountry,940,94.0,string,Reserved | India | Viet Nam,60
+srcintf,925,92.5,string,internal4 | internal2 | wan1,75
+srcintfrole,940,94.0,string,lan | dmz | wan,60
+srcip,940,94.0,string,10.10.40.156 | 10.10.20.11 | 10.10.40.225,60
+srcport,778,77.8,int,37918 | 53067 | 50951,222
+status,147,14.7,string,failed,853
+subtype,1000,100.0,string,dns | forward | system,0
+time,1000,100.0,string,08:48:26 | 08:48:27 | 08:48:28,0
+type,1000,100.0,string,utm | traffic | event,0
+tz,1000,100.0,string,+0530,0
+ui,147,14.7,string,https(209.50.167.232) | https(94.154.43.56) | https(104.207.42.233),853
+url,58,5.8,string,/ | /download/setup.exe,942
+user,151,15.1,string,admin | chethan | tps_aster,849
+vd,1000,100.0,string,root,0
+virus,13,1.3,string,W31/Driverless.TUV!tr | W29/SpamAssassin.VWX!tr | W10/hidden!tr,987
