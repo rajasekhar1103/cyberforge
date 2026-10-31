@@ -6,6 +6,7 @@ use clap::Parser as ClapParser;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -14,6 +15,7 @@ use std::sync::Arc;
 const MAX_ROW_GROUP_SIZE: usize = 64_000;
 const MAX_BATCH_SIZE: usize = 25_000;
 const MAX_RETAINED_LINE_CAPACITY: usize = 1024 * 1024;
+const MAX_RAW_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(ClapParser, Debug)]
 struct Args {
@@ -23,6 +25,28 @@ struct Args {
     output: String,
     #[arg(long, default_value_t = 1000)]
     batch_size: usize,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Parsing worker threads; defaults to two bounded workers"
+    )]
+    threads: usize,
+}
+
+struct RawRecord {
+    start: usize,
+    end: usize,
+    offset: u64,
+    line_no: i64,
+}
+
+struct ParsedRecord {
+    fields: BTreeMap<String, String>,
+    fields_json: String,
+    warnings_json: Option<String>,
+    malformed: bool,
+    offset: i64,
+    line_no: i64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -281,9 +305,32 @@ fn strip_record_terminator(record: &mut Vec<u8>) {
     }
 }
 
+fn parse_record(bytes: &[u8], record: &RawRecord) -> Result<ParsedRecord> {
+    let result = parse_kv(&bytes[record.start..record.end]);
+    let fields: BTreeMap<String, String> = result.fields.into_iter().collect();
+    let fields_json = serde_json::to_string(&fields)?;
+    let warnings_json = if result.warnings.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&result.warnings)?)
+    };
+
+    Ok(ParsedRecord {
+        fields,
+        fields_json,
+        warnings_json,
+        malformed: result.malformed,
+        offset: i64::try_from(record.offset)?,
+        line_no: record.line_no,
+    })
+}
+
 fn run(args: Args) -> Result<RunStats> {
     if !(1..=MAX_BATCH_SIZE).contains(&args.batch_size) {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
+    }
+    if args.threads == 0 {
+        bail!("--threads must be greater than zero");
     }
 
     let total_size = std::fs::metadata(&args.input)?.len();
@@ -317,55 +364,83 @@ fn run(args: Args) -> Result<RunStats> {
     let mut line_no = 0_i64;
     let mut parsed_records = 0_i64;
     let mut quarantined_records = 0_i64;
+    let mut raw_bytes = Vec::new();
+    let mut records = Vec::with_capacity(args.batch_size);
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build()?;
 
     loop {
-        let bytes_read = reader.read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
+        while records.len() < args.batch_size && raw_bytes.len() < MAX_RAW_BATCH_BYTES {
+            let bytes_read = reader.read_until(b'\n', &mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            line_no += 1;
+            strip_record_terminator(&mut line);
+            let start = raw_bytes.len();
+            raw_bytes.extend_from_slice(&line);
+            records.push(RawRecord {
+                start,
+                end: raw_bytes.len(),
+                offset,
+                line_no,
+            });
+            offset += u64::try_from(bytes_read)?;
+
+            if line.capacity() > MAX_RETAINED_LINE_CAPACITY {
+                line = Vec::new();
+            } else {
+                line.clear();
+            }
+        }
+
+        if records.is_empty() {
             break;
         }
 
-        line_no += 1;
-        strip_record_terminator(&mut line);
-        let result = parse_kv(&line);
-        let fields: BTreeMap<&str, &str> = result
-            .fields
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        let fields_json = serde_json::to_string(&fields)?;
-        let parse_status = if result.malformed {
-            quarantined_records += 1;
-            "quarantined"
+        let parsed = if args.threads == 1 {
+            records
+                .iter()
+                .map(|record| parse_record(&raw_bytes, record))
+                .collect::<Result<Vec<_>>>()?
         } else {
-            parsed_records += 1;
-            "parsed"
-        };
-        let warnings_json = if result.warnings.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&result.warnings)?)
+            thread_pool.install(|| {
+                records
+                    .par_iter()
+                    .map(|record| parse_record(&raw_bytes, record))
+                    .collect::<Result<Vec<_>>>()
+            })?
         };
 
-        batch.append(
-            &args.input,
-            line_no,
-            i64::try_from(offset)?,
-            &fields,
-            &line,
-            &fields_json,
-            parse_status,
-            warnings_json.as_deref(),
-        );
-        offset += u64::try_from(bytes_read)?;
-        if line.capacity() > MAX_RETAINED_LINE_CAPACITY {
-            line = Vec::new();
-        } else {
-            line.clear();
-        }
+        for (record, parsed) in records.iter().zip(parsed) {
+            let fields: BTreeMap<&str, &str> = parsed
+                .fields
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let parse_status = if parsed.malformed {
+                quarantined_records += 1;
+                "quarantined"
+            } else {
+                parsed_records += 1;
+                "parsed"
+            };
 
-        if batch.rows >= args.batch_size {
-            batch.flush(&mut writer, &schema)?;
+            batch.append(
+                &args.input,
+                parsed.line_no,
+                parsed.offset,
+                &fields,
+                &raw_bytes[record.start..record.end],
+                &parsed.fields_json,
+                parse_status,
+                parsed.warnings_json.as_deref(),
+            );
         }
+        batch.flush(&mut writer, &schema)?;
+        writer.flush()?;
 
         if line_no % 100_000 == 0 {
             let pct = (offset as f64 / total_size as f64) * 100.0;
@@ -373,6 +448,13 @@ fn run(args: Args) -> Result<RunStats> {
                 "processed {} lines, {} bytes ({:.2}%) parsed={} quarantined={}",
                 line_no, offset, pct, parsed_records, quarantined_records
             );
+        }
+
+        records.clear();
+        if raw_bytes.capacity() >= MAX_RAW_BATCH_BYTES * 2 {
+            raw_bytes = Vec::new();
+        } else {
+            raw_bytes.clear();
         }
     }
 
@@ -472,10 +554,23 @@ mod tests {
                 input: String::new(),
                 output: String::new(),
                 batch_size,
+                threads: 1,
             })
             .unwrap_err();
             assert!(error.to_string().contains("--batch-size"));
         }
+    }
+
+    #[test]
+    fn thread_count_must_be_positive() {
+        let error = run(Args {
+            input: String::new(),
+            output: String::new(),
+            batch_size: 1,
+            threads: 0,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("--threads"));
     }
 
     #[test]
@@ -505,6 +600,7 @@ mod tests {
             input: input_path.to_string_lossy().into_owned(),
             output: output_path.to_string_lossy().into_owned(),
             batch_size: 2,
+            threads: 1,
         })
         .unwrap();
         assert_eq!(
@@ -570,5 +666,100 @@ mod tests {
                 .unwrap(),
             "18446744073709551615"
         );
+    }
+
+    #[test]
+    fn parallel_parsing_preserves_order_and_output() {
+        let directory = tempdir().unwrap();
+        let input_path = directory.path().join("input.log");
+        let sequential_path = directory.path().join("sequential.parquet");
+        let parallel_path = directory.path().join("parallel.parquet");
+        let records: [&[u8]; 6] = [
+            b"type=foo eventtime=18446744073709551615\n",
+            b"dup=1 dup=2\r\n",
+            b"x=\"unfinished\n",
+            b"bad=\xff\n",
+            b"good=1 trailing\n",
+            b"escaped=\"a\\\\b \\\"q\\\"\"",
+        ];
+        let mut input = File::create(&input_path).unwrap();
+        for record in records {
+            input.write_all(record).unwrap();
+        }
+        drop(input);
+
+        for (output_path, threads) in [(&sequential_path, 1), (&parallel_path, 2)] {
+            let stats = run(Args {
+                input: input_path.to_string_lossy().into_owned(),
+                output: output_path.to_string_lossy().into_owned(),
+                batch_size: 2,
+                threads,
+            })
+            .unwrap();
+            assert_eq!(
+                stats,
+                RunStats {
+                    lines: 6,
+                    parsed: 3,
+                    quarantined: 3
+                }
+            );
+        }
+
+        let read_batches = |path: &std::path::Path| {
+            ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                .unwrap()
+                .with_batch_size(2)
+                .build()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let sequential = read_batches(&sequential_path);
+        let parallel = read_batches(&parallel_path);
+        assert_eq!(sequential.len(), parallel.len());
+        for (sequential_batch, parallel_batch) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(sequential_batch.num_rows(), parallel_batch.num_rows());
+            for (sequential_column, parallel_column) in sequential_batch
+                .columns()
+                .iter()
+                .zip(parallel_batch.columns())
+            {
+                assert_eq!(sequential_column.to_data(), parallel_column.to_data());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_record_batches_are_bounded_by_bytes_and_keep_rows() {
+        let directory = tempdir().unwrap();
+        let input_path = directory.path().join("input.log");
+        let output_path = directory.path().join("output.parquet");
+        let large_record = format!("value={}\n", "x".repeat(MAX_RAW_BATCH_BYTES));
+        std::fs::write(&input_path, format!("{large_record}value=last")).unwrap();
+
+        let stats = run(Args {
+            input: input_path.to_string_lossy().into_owned(),
+            output: output_path.to_string_lossy().into_owned(),
+            batch_size: 100,
+            threads: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            stats,
+            RunStats {
+                lines: 2,
+                parsed: 2,
+                quarantined: 0
+            }
+        );
+
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(File::open(output_path).unwrap()).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 2);
+        assert_eq!(builder.metadata().num_row_groups(), 2);
+        let reader = builder.build().unwrap();
+        let rows = reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>();
+        assert_eq!(rows, 2);
     }
 }

@@ -147,6 +147,81 @@ class StreamingDetectionTests(unittest.TestCase):
         self.assertEqual(metadata.num_rows, event_count)
         self.assertGreaterEqual(metadata.num_row_groups, 2)
 
+    def test_sequential_and_parallel_parquet_decoding_are_semantically_equal(self):
+        events = []
+        for line_number, (event_type, subtype, fields) in enumerate([
+            ("event", "system", {"action": "login", "status": "failed", "srcip": "192.0.2.1"}),
+            ("event", "system", {"action": "login", "status": "failed", "srcip": "192.0.2.1"}),
+            ("event", "system", {"action": "login", "status": "failed", "srcip": "192.0.2.1"}),
+            ("traffic", "forward", {"bytes": "150", "message": "keep"}),
+            ("traffic", "forward", {"bytes": "50", "message": "drop"}),
+        ], start=1):
+            events.append({
+                "type": event_type,
+                "subtype": subtype,
+                "fields_json": json.dumps({"type": event_type, "subtype": subtype, **fields}),
+                "source_file": "sample.log",
+                "line_number": line_number,
+            })
+        self.write_events(events)
+        self.write_rules([
+            {
+                "rule_id": "AUTH-AGG",
+                "name": "Repeated failed logins",
+                "category": "authentication",
+                "severity": "medium",
+                "description": "Thresholded login failures",
+                "log_types": ["event|system"],
+                "conditions": [
+                    {"field": "action", "op": "eq", "value": "login"},
+                    {"field": "status", "op": "eq", "value": "failed"},
+                ],
+                "aggregation": {"key": "srcip", "threshold": 2},
+            },
+            {
+                "rule_id": "TRAFFIC-GENERIC",
+                "name": "Large traffic",
+                "category": "network",
+                "severity": "low",
+                "description": "Traffic above threshold",
+                "log_types": ["traffic"],
+                "conditions": [{"field": "bytes", "op": "gte", "value": 100}],
+            },
+            {
+                "rule_id": "GLOBAL",
+                "name": "Message exists",
+                "category": "other",
+                "severity": "low",
+                "description": "Any event with a message",
+                "conditions": [{"field": "message", "op": "exists"}],
+            },
+        ])
+
+        threaded_output = self.directory / "threaded.parquet"
+        sequential_output = self.directory / "sequential.parquet"
+        run(
+            str(self.input_path),
+            str(self.rules_path),
+            str(threaded_output),
+            batch_size=2,
+            use_threads=True,
+        )
+        run(
+            str(self.input_path),
+            str(self.rules_path),
+            str(sequential_output),
+            batch_size=2,
+            use_threads=False,
+        )
+
+        threaded = pq.read_table(threaded_output).drop(["detection_id"]).to_pylist()
+        sequential = pq.read_table(sequential_output).drop(["detection_id"]).to_pylist()
+        self.assertEqual(threaded, sequential)
+        self.assertEqual(
+            [row["rule_id"] for row in threaded],
+            ["AUTH-AGG", "AUTH-AGG", "TRAFFIC-GENERIC", "GLOBAL", "GLOBAL"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

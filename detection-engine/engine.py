@@ -107,7 +107,7 @@ def compile_rules(rules):
         plan = CompiledRule(rule, tuple(rule.get("conditions", ())), order)
         plans.append(plan)
         log_types = tuple(dict.fromkeys(
-            item.split("|", 1) if "|" in item else (item, None)
+            tuple(item.split("|", 1)) if "|" in item else (item, None)
             for item in rule.get("log_types", ())
         ))
         if not log_types:
@@ -124,14 +124,13 @@ def compile_rules(rules):
     def candidates(event_type, subtype):
         key = (event_type, subtype)
         if key not in candidates_cache:
-            matching = {
-                plan.order: plan
-                for plan in (
-                    global_rules
-                    + by_type.get(event_type, ())
-                    + by_pair.get(key, ())
-                )
-            }
+            matching = {}
+            for plan in (
+                *global_rules,
+                *by_type.get(event_type, ()),
+                *by_pair.get(key, ()),
+            ):
+                matching[plan.order] = plan
             candidates_cache[key] = tuple(
                 matching[index] for index in sorted(matching)
             )
@@ -214,11 +213,11 @@ def _make_detection(rule, ev, matched):
     }
 
 
-def run(input_path, rules_path, output_path, batch_size=5000):
+def run(input_path, rules_path, output_path, batch_size=5000, use_threads=True):
     if batch_size < 1:
         raise ValueError("batch_size must be greater than zero")
 
-    plans, candidates_for = compile_rules(load_rules(rules_path))
+    _, candidates_for = compile_rules(load_rules(rules_path))
     schema = _make_schema()
     parquet_file = pq.ParquetFile(input_path)
     missing_columns = set(INPUT_COLUMNS).difference(parquet_file.schema_arrow.names)
@@ -233,6 +232,7 @@ def run(input_path, rules_path, output_path, batch_size=5000):
         for batch in parquet_file.iter_batches(
             batch_size=batch_size,
             columns=list(INPUT_COLUMNS),
+            use_threads=use_threads,
         ):
             columns = {
                 name: batch.column(index).to_pylist()
@@ -282,5 +282,12 @@ if __name__ == "__main__":
     parser.add_argument("--rules", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch-size", type=int, default=5000)
+    parser.add_argument(
+        "--sequential-read",
+        action="store_false",
+        dest="use_threads",
+        help="Disable PyArrow's bounded parallel Parquet decoding",
+    )
+    parser.set_defaults(use_threads=True)
     args = parser.parse_args()
-    run(args.input, args.rules, args.output, args.batch_size)
+    run(args.input, args.rules, args.output, args.batch_size, args.use_threads)
