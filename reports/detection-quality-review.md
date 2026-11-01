@@ -1,5 +1,9 @@
 # Detection Quality Review
 
+> Historical 1,000-record sample review of the pre-accuracy-audit rules. For current
+> full-input coverage, rule changes, and ground-truth limitations, see
+> [detection-accuracy-audit.md](./detection-accuracy-audit.md).
+
 ## Verified counts
 Total detections: 258
 Unique source events: 237

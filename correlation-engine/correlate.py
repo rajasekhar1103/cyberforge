@@ -115,19 +115,15 @@ class IncidentAccumulator:
         if not reasons:
             reasons.append("single detection")
 
-        confidence = "high" if len(self.rules) > 1 or len(self.categories) > 1 else "medium"
-        if self.detection_count == 1:
-            confidence = "low"
-
         return {
             "incident_id": self.incident_id,
-            "title": f"Incident: {', '.join(sorted(self.categories))}",
+            "title": f"Observation cluster: {', '.join(sorted(self.categories))}",
             "description": (
-                f"Correlated {self.detection_count} detections across "
-                f"{len(self.rules)} rules"
+                f"Grouped {self.detection_count} detection observations across "
+                f"{len(self.rules)} rules; not a confirmed incident"
             ),
             "severity": self.max_severity,
-            "confidence": confidence,
+            "confidence": None,
             "first_observed": (
                 str(self.first_time) if self.first_time is not None else None
             ),
@@ -183,6 +179,9 @@ def run(
             FROM read_parquet(?)
             ORDER BY srcip ASC NULLS LAST,
                      COALESCE(_event_time, CAST(0 AS HUGEINT)) ASC,
+                     source_file ASC NULLS LAST,
+                     line_number ASC NULLS LAST,
+                     rule_id ASC,
                      detection_id ASC
         """
         cursor = connection.execute(query, [str(det_path)])
@@ -308,7 +307,12 @@ if __name__ == "__main__":
     parser.add_argument("--detections", required=True)
     parser.add_argument("--out-incidents", required=True)
     parser.add_argument("--out-rel", required=True)
-    parser.add_argument("--window", type=int, default=3600000000000)
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=3600000000000,
+        help="Incident gap window in eventtime units (nanoseconds; default: one hour)",
+    )
     parser.add_argument("--memory-limit", default="512MB")
     parser.add_argument("--temp-directory")
     args = parser.parse_args()

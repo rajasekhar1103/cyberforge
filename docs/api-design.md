@@ -13,6 +13,17 @@ The examples use actual values inspected in:
 
 The response envelopes, health response, pagination cursor, and errors are illustrative proposed API values. The IDs and record values shown in successful analytics examples are copied from those generated artifacts, not invented. These artifacts are a temporary 1,000-input-record sample, not a production deployment. The top-level `out.parquet` was not readable as Parquet, so no API example is based on it.
 
+**Detection caveat:** these stored examples predate the current rule audit. In particular,
+the historical AUTH-001 example below is a single failed login and must not be treated
+as a valid output of the current rule, which requires five failed admin logins from one
+source within 600 seconds. Current confidence is `null` until calibrated, VPN-001/T1133
+is no longer an active mapping, and correlation output represents an observation
+cluster rather than a confirmed incident. These legacy records illustrate API shape
+only. The historical graph also contains a T1110 mapping sourced from one failed-login
+row; that mapping is unsupported under the current policy and must not be treated as a
+valid current graph relationship. The detection-detail example below uses a current
+row from `D:\cyberforge-run-20261101-0810\accuracy-updated-strict.parquet`.
+
 ## Conventions
 
 - Base path: `/api`; JSON UTF-8 responses.
@@ -355,7 +366,9 @@ Reject malformed IDs/parameters with `400 invalid_parameter`; reject `start_time
 
 **Evidence semantics:** Graph-edge `evidence` and `line` on `MAPPED_TO_TECHNIQUE` edges identify the source record that produced the detection. They establish source-record provenance only; they do not prove why the detection was mapped to a technique. `RELATED_TO_INCIDENT` evidence is a relationship reference (`detection_id` plus `incident_id`), not a raw-log citation. Analytical mapping provenance would identify the rule or mapping catalog/version and mapping rationale; the current graph does not store that provenance explicitly. Preserve `observed=false` on both derived relationship types, including `MAPPED_TO_TECHNIQUE`.
 
-**Success — 200** (nodes and edges below are actual graph.json entries for the actual singleton incident/detection; graph metadata is proposed):
+**Success — 200** (nodes and edges below are actual entries from the historical
+graph.json sample; graph metadata is proposed. See the detection caveat above before
+interpreting the legacy `MAPPED_TO_TECHNIQUE` edge):
 
 ```json
 {
@@ -452,38 +465,56 @@ Reject malformed IDs/parameters with `400 invalid_parameter`; reject `start_time
 
 **Data source/query:** Exact lookup by `detection_id` in `detections.parquet`. Decode the three JSON-serialized fields before returning the Detection object.
 
-**Success — 200** (full actual detection row):
+**Success — 200** (current full-run detection row; JSON fields decoded):
 
 ```json
 {
-  "detection_id": "f906e5df-a041-420d-bac1-63d840051506",
+  "detection_id": "e9ceef79-1792-40eb-96f8-c4825c283a48",
   "rule_id": "AUTH-001",
   "rule_name": "Repeated admin login failure",
   "category": "authentication",
   "severity": "medium",
-  "description": "FortiGate event system login failure by admin",
-  "srcip": "209.50.176.220",
+  "description": "At least five failed admin logins from one source IP within ten minutes; indicates a brute-force pattern, not proof of compromise.",
+  "srcip": "45.74.28.190",
   "dstip": "10.10.99.1",
   "username": "admin",
   "host": "FGT60FTK00000000",
-  "eventtime": "1792745341702348000",
+  "eventtime": "1792745784383240000",
   "date": "2026-10-23",
-  "time": "08:49:01",
+  "time": "08:56:24",
   "tz": "+0530",
-  "source_file": "C:\\Users\\nsrn\\AppData\\Local\\Temp\\kilo\\sample1000.log",
-  "line_number": 159,
+  "source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log",
+  "line_number": 2160,
   "evidence": {
-    "srcip": "209.50.176.220",
+    "srcip": "45.74.28.190",
     "user": "admin",
     "status": "failed",
     "reason": "name_invalid",
-    "msg": "Administrator admin login failed from https(209.50.176.220) because of invalid user name"
+    "msg": "Administrator admin login failed from https(45.74.28.190) because of invalid user name"
   },
   "matched_conditions": [
     {"field": "action", "op": "eq", "value": "login"},
-    {"field": "status", "op": "eq", "value": "failed"}
+    {"field": "status", "op": "eq", "value": "failed"},
+    {"field": "user", "op": "eq", "value": "admin"},
+    {
+      "field": "aggregation",
+      "op": "count_within",
+      "value": {
+        "key": "srcip",
+        "threshold": 5,
+        "window_seconds": 600,
+        "observed_count": 5,
+        "source_event_refs": [
+          {"source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log", "line_number": 174},
+          {"source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log", "line_number": 334},
+          {"source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log", "line_number": 579},
+          {"source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log", "line_number": 1714},
+          {"source_file": "C:\\Users\\notyo\\OneDrive\\Desktop\\strc\\firex-10G.log", "line_number": 2160}
+        ]
+      }
+    }
   ],
-  "confidence": "medium",
+  "confidence": null,
   "mitre_techniques": ["T1110"]
 }
 ```
@@ -500,7 +531,7 @@ Reject malformed IDs/parameters with `400 invalid_parameter`; reject `start_time
 
 **Validation:** Reject invalid pagination values with `400 invalid_parameter`. The repository has technique IDs in each detection's serialized `mitre_techniques` JSON array, but no verified technique catalog/name/tactic file. Do not manufacture names.
 
-**Data source/query:** Read and safely expand valid `mitre_techniques` JSON arrays from detections; aggregate distinct detection counts by exact ID; sort technique IDs ascending and paginate. The current inspected sample contains one unique ID, `T1110`, associated with 147 detections.
+**Data source/query:** Read and safely expand valid `mitre_techniques` JSON arrays from detections; aggregate distinct detection counts by exact ID; sort technique IDs ascending and paginate. The legacy 1,000-record sample contains one ID, `T1110`, on 147 detections. In the current full detector output, `T1110` is present on the 14,739 AUTH-001 aggregate detections; this is a rule-output count, not measured technique-label accuracy.
 
 **Success — 200** (technique value/count are actual; pagination is proposed):
 

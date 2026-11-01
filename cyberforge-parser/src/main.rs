@@ -9,20 +9,28 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_ROW_GROUP_SIZE: usize = 64_000;
 const MAX_BATCH_SIZE: usize = 25_000;
 const MAX_RETAINED_LINE_CAPACITY: usize = 1024 * 1024;
 const MAX_RAW_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const TIMESTAMP_SCAN_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+const TIMESTAMP_PATTERN_SIZE: usize = 29;
 
 #[derive(ClapParser, Debug)]
 struct Args {
     #[arg(short, long)]
     input: String,
-    #[arg(short, long)]
-    output: String,
+    #[arg(short, long, required_unless_present = "scan_timestamps")]
+    output: Option<String>,
+    #[arg(
+        long,
+        help = "Scan timestamps only, without parsing or writing Parquet"
+    )]
+    scan_timestamps: bool,
     #[arg(long, default_value_t = 1000)]
     batch_size: usize,
     #[arg(
@@ -61,6 +69,13 @@ struct RunStats {
     lines: i64,
     parsed: i64,
     quarantined: i64,
+}
+
+struct TimestampScanStats {
+    count: u64,
+    first: Option<[u8; TIMESTAMP_PATTERN_SIZE]>,
+    last: Option<[u8; TIMESTAMP_PATTERN_SIZE]>,
+    elapsed: Duration,
 }
 
 struct Batch {
@@ -325,6 +340,204 @@ fn parse_record(bytes: &[u8], record: &RawRecord) -> Result<ParsedRecord> {
     })
 }
 
+fn is_digit(byte: u8) -> bool {
+    byte.is_ascii_digit()
+}
+
+fn timestamp_at(bytes: &[u8], index: usize) -> bool {
+    let timestamp = &bytes[index..index + TIMESTAMP_PATTERN_SIZE];
+    if !timestamp.starts_with(b"date=")
+        || timestamp[9] != b'-'
+        || timestamp[12] != b'-'
+        || timestamp[15] != b' '
+        || &timestamp[16..21] != b"time="
+        || timestamp[23] != b':'
+        || timestamp[26] != b':'
+        || ![5, 6, 7, 8, 10, 11, 13, 14, 21, 22, 24, 25, 27, 28]
+            .iter()
+            .all(|position| is_digit(timestamp[*position]))
+    {
+        return false;
+    }
+
+    let number = |start: usize, length: usize| {
+        timestamp[start..start + length]
+            .iter()
+            .fold(0_u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+    };
+    let year = number(5, 4);
+    let month = number(10, 2);
+    let day = number(13, 2);
+    let hour = number(21, 2);
+    let minute = number(24, 2);
+    let second = number(27, 2);
+    if !(1..=12).contains(&month) || !(0..=23).contains(&hour) || minute > 59 || second > 59 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
+fn timestamp_epoch_seconds(timestamp: &[u8; TIMESTAMP_PATTERN_SIZE]) -> u64 {
+    let number = |start: usize, length: usize| {
+        timestamp[start..start + length]
+            .iter()
+            .fold(0_u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+    };
+    let year = number(5, 4);
+    let month = number(10, 2);
+    let day = number(13, 2);
+    let hour = number(21, 2);
+    let minute = number(24, 2);
+    let second = number(27, 2);
+    let days_before_year =
+        |year: u64| 365 * year + (year + 3) / 4 - (year + 99) / 100 + (year + 399) / 400;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_lengths = [
+        31_u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let days_in_prior_months: u64 = month_lengths[..month as usize - 1].iter().sum();
+    let days = days_before_year(year) + days_in_prior_months + day - 1;
+    days * 86_400 + hour * 3_600 + minute * 60 + second
+}
+
+fn scan_timestamps(path: &str) -> Result<TimestampScanStats> {
+    let total_size = std::fs::metadata(path)?.len();
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; TIMESTAMP_SCAN_BUFFER_SIZE + TIMESTAMP_PATTERN_SIZE - 1];
+    let mut carry = 0;
+    let mut count = 0_u64;
+    let mut first: Option<[u8; TIMESTAMP_PATTERN_SIZE]> = None;
+    let mut last: Option<[u8; TIMESTAMP_PATTERN_SIZE]> = None;
+    let mut bytes_scanned = 0_u64;
+    let start = Instant::now();
+    let mut last_progress = start;
+
+    loop {
+        let bytes_read = file.read(&mut buffer[carry..carry + TIMESTAMP_SCAN_BUFFER_SIZE])?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let available = carry + bytes_read;
+        let scan_end = available.saturating_sub(TIMESTAMP_PATTERN_SIZE - 1);
+        for index in 0..scan_end {
+            if buffer[index] != b'd' || !timestamp_at(&buffer, index) {
+                continue;
+            }
+
+            let mut timestamp = [0_u8; TIMESTAMP_PATTERN_SIZE];
+            timestamp.copy_from_slice(&buffer[index..index + TIMESTAMP_PATTERN_SIZE]);
+            if first.as_ref().map_or(true, |value| timestamp < *value) {
+                first = Some(timestamp);
+            }
+            if last.as_ref().map_or(true, |value| timestamp > *value) {
+                last = Some(timestamp);
+            }
+            count += 1;
+        }
+
+        carry = available - scan_end;
+        buffer.copy_within(scan_end..available, 0);
+        bytes_scanned += bytes_read as u64;
+
+        if last_progress.elapsed() >= Duration::from_millis(500) {
+            let elapsed = start.elapsed().as_secs_f64();
+            let mb_per_second = bytes_scanned as f64 / (1024.0 * 1024.0) / elapsed;
+            let fraction = if total_size == 0 {
+                1.0
+            } else {
+                bytes_scanned as f64 / total_size as f64
+            };
+            let eta = if mb_per_second > 0.0 {
+                Duration::from_secs_f64(
+                    (total_size.saturating_sub(bytes_scanned) as f64 / (1024.0 * 1024.0))
+                        / mb_per_second,
+                )
+            } else {
+                Duration::ZERO
+            };
+            eprint!(
+                "\rScanning timestamps: {:5.1}% | {:.1} MB/s | ETA {}",
+                fraction * 100.0,
+                mb_per_second,
+                format_duration(eta)
+            );
+            std::io::stderr().flush()?;
+            last_progress = Instant::now();
+        }
+    }
+
+    let elapsed = start.elapsed();
+    if total_size > 0 {
+        let mb_per_second =
+            bytes_scanned as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(0.001);
+        eprint!(
+            "\rScanning timestamps: 100.0% | {:.1} MB/s | ETA 00:00:00\n",
+            mb_per_second
+        );
+        std::io::stderr().flush()?;
+    }
+
+    Ok(TimestampScanStats {
+        count,
+        first,
+        last,
+        elapsed,
+    })
+}
+
+fn print_timestamp_scan(stats: TimestampScanStats) {
+    println!("Timestamped records: {}", stats.count);
+    match (stats.first, stats.last) {
+        (Some(first), Some(last)) => {
+            let first_text = String::from_utf8_lossy(&first);
+            let last_text = String::from_utf8_lossy(&last);
+            let first_value = &first_text[5..];
+            let last_value = &last_text[5..];
+            let span_seconds = timestamp_epoch_seconds(&last) - timestamp_epoch_seconds(&first);
+            println!("Earliest timestamp:  {first_value}");
+            println!("Latest timestamp:    {last_value}");
+            println!(
+                "Log time span:       {} days, {:02}:{:02}:{:02}",
+                span_seconds / 86_400,
+                (span_seconds / 3_600) % 24,
+                (span_seconds / 60) % 60,
+                span_seconds % 60
+            );
+        }
+        _ => println!("No timestamps found."),
+    }
+    println!("Scan runtime:        {}", format_duration(stats.elapsed));
+}
+
 fn run(args: Args) -> Result<RunStats> {
     if !(1..=MAX_BATCH_SIZE).contains(&args.batch_size) {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
@@ -351,7 +564,11 @@ fn run(args: Args) -> Result<RunStats> {
         Field::new("parse_status", DataType::Utf8, false),
         Field::new("parse_warnings", DataType::Utf8, true),
     ]));
-    let out = File::create(&args.output)?;
+    let output_path = args
+        .output
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--output is required unless --scan-timestamps is used"))?;
+    let out = File::create(output_path)?;
     let props = WriterProperties::builder()
         .set_max_row_group_size(MAX_ROW_GROUP_SIZE)
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(1)?))
@@ -469,7 +686,13 @@ fn run(args: Args) -> Result<RunStats> {
 }
 
 fn main() -> Result<()> {
-    let stats = run(Args::parse())?;
+    let args = Args::parse();
+    if args.scan_timestamps {
+        print_timestamp_scan(scan_timestamps(&args.input)?);
+        return Ok(());
+    }
+
+    let stats = run(args)?;
     println!(
         "done lines={} parsed={} quarantined={}",
         stats.lines, stats.parsed, stats.quarantined
@@ -548,11 +771,36 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_scan_handles_binary_bytes_and_reports_the_full_range() {
+        let directory = tempdir().unwrap();
+        let input_path = directory.path().join("input.log");
+        std::fs::write(
+            &input_path,
+            b"date=2026-10-23 time=08:48:26 type=traffic\n\
+              date=2026-02-30 time=12:00:00 invalid=date\n\
+              date=2026-10-30 time=08:48:25 \xff\xfe",
+        )
+        .unwrap();
+
+        let stats = scan_timestamps(input_path.to_str().unwrap()).unwrap();
+
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.first.unwrap(), *b"date=2026-10-23 time=08:48:26");
+        assert_eq!(stats.last.unwrap(), *b"date=2026-10-30 time=08:48:25");
+        assert_eq!(
+            timestamp_epoch_seconds(&stats.last.unwrap())
+                - timestamp_epoch_seconds(&stats.first.unwrap()),
+            604_799
+        );
+    }
+
+    #[test]
     fn batch_size_is_bounded() {
         for batch_size in [0, MAX_BATCH_SIZE + 1] {
             let error = run(Args {
                 input: String::new(),
-                output: String::new(),
+                output: None,
+                scan_timestamps: false,
                 batch_size,
                 threads: 1,
             })
@@ -565,7 +813,8 @@ mod tests {
     fn thread_count_must_be_positive() {
         let error = run(Args {
             input: String::new(),
-            output: String::new(),
+            output: None,
+            scan_timestamps: false,
             batch_size: 1,
             threads: 0,
         })
@@ -598,7 +847,8 @@ mod tests {
 
         let stats = run(Args {
             input: input_path.to_string_lossy().into_owned(),
-            output: output_path.to_string_lossy().into_owned(),
+            output: Some(output_path.to_string_lossy().into_owned()),
+            scan_timestamps: false,
             batch_size: 2,
             threads: 1,
         })
@@ -691,7 +941,8 @@ mod tests {
         for (output_path, threads) in [(&sequential_path, 1), (&parallel_path, 2)] {
             let stats = run(Args {
                 input: input_path.to_string_lossy().into_owned(),
-                output: output_path.to_string_lossy().into_owned(),
+                output: Some(output_path.to_string_lossy().into_owned()),
+                scan_timestamps: false,
                 batch_size: 2,
                 threads,
             })
@@ -740,7 +991,8 @@ mod tests {
 
         let stats = run(Args {
             input: input_path.to_string_lossy().into_owned(),
-            output: output_path.to_string_lossy().into_owned(),
+            output: Some(output_path.to_string_lossy().into_owned()),
+            scan_timestamps: false,
             batch_size: 100,
             threads: 2,
         })

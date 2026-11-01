@@ -88,7 +88,7 @@ def pretty_severity_counts(counts: dict[str, int]) -> dict[str, int]:
 
 
 def render_incident_detail(base_url: str, incident_id: str) -> None:
-    st.markdown(f"#### Incident `{incident_id}`")
+    st.markdown(f"#### Observation cluster `{incident_id}`")
     try:
         detail = api_get(
             base_url,
@@ -102,11 +102,11 @@ def render_incident_detail(base_url: str, incident_id: str) -> None:
 
     left, right = st.columns([1.5, 1])
     with left:
-        st.markdown(f"**{incident.get('title', 'Incident')}**")
+        st.markdown(f"**{incident.get('title', 'Observation cluster')}**")
         st.write(incident.get("description", ""))
         st.caption(
             f"Severity: {incident.get('severity', 'unknown')} · "
-            f"Confidence: {incident.get('confidence', 'unknown')} · "
+            f"Confidence: {incident.get('confidence') or 'unvalidated'} · "
             f"Status: {incident.get('status', 'unknown')}"
         )
     with right:
