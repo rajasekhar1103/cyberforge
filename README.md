@@ -198,6 +198,31 @@ rules:
 | Sampled peak working set | 1,146 MiB | 1,166 MiB |
 | Output size | 75,890,887 bytes | 55,739,873 bytes |
 
+### Planted-attack target scorecard
+
+The targets below are the requested benchmark goals. “Not measured” means the
+repository has no official planted-attack ground truth and scoring specification;
+it does not mean the system scored zero.
+
+| What we measure | Good target | Great target | Current result on this run | Assessment |
+|---|---:|---:|---|---|
+| Detection — share of planted attack steps found | >70% | >90% | Not measured: no labeled planted-step set | Cannot score |
+| Correct labels — found steps with correct ATT&CK technique | >60% | >85% | Not measured: no expected technique labels | Cannot score |
+| Attack path — planted attacks reconstructed with all steps in order | At least half | All | Not measured: no labeled attack IDs/step order | Cannot score |
+| False alarms — incidents that are not real attacks | <30% | <10% | Not measured: no adjudicated benign/attack labels or scoring unit | Cannot score |
+| Processing time — full chosen tier | <3 hours | <1 hour | Detector stage: **89.57 s** for 11,228,047 Parquet rows | Great for detector stage; total parse-to-results time not measured |
+| Memory — peak during processing | <16 GB | <8 GB | Detector sampled peak working set: **1,166 MiB** (~1.14 GiB) | Great for detector stage; sampled every 500 ms |
+| Investigation speed — open one incident attack path | <2 s | <500 ms | Not measured with a defined repeated latency benchmark | Cannot score |
+
+The processing and memory observations cover the updated detector run, not the
+complete parse → detect → correlate → graph → dashboard workflow. The detector
+comparison showed slightly longer runtime and higher sampled working set than its
+preserved baseline, despite lower output volume. A ground-truth score requires a
+labeled evaluation file with stable source-event references, attack/campaign IDs,
+ordered step indices, expected techniques, adjudicated benign examples, a scoring
+unit/deduplication policy, and a held-out test split. See the
+[audit's scoring requirements](reports/detection-accuracy-audit.md#accuracy-status-and-data-needed).
+
 Changes include:
 
 - On identical rules and input, the updated detector emits 37.53% fewer rows and
@@ -235,6 +260,25 @@ deduplicated IPS observations, and stronger evidence provenance—not a throughp
 See the
 [detection accuracy audit](reports/detection-accuracy-audit.md) for rule counts,
 parser statistics, methodology, and the scoring-data requirements.
+
+### Benchmark machine and software
+
+The full detector run was measured on this laptop:
+
+| Component | Configuration |
+|---|---|
+| Laptop | ASUS Vivobook X1605VA |
+| CPU | 13th Gen Intel Core i5-13500H |
+| Physical memory | 16 GB class; Windows reports approximately 15.6 GiB |
+| Graphics | Intel Iris Xe Graphics |
+| Operating system | Windows 11 Home Single Language, build 26300 |
+| Python | 3.14.4 |
+| Rust compiler | rustc 1.99.1 |
+| Cargo | 1.99.1 |
+
+These are the recorded environment details for this run, not a minimum or recommended
+production configuration. Runtime and working-set results depend on the machine,
+disk, background load, and input.
 
 ## Tests
 
