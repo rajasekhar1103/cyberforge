@@ -89,17 +89,17 @@ From the project root, install API and test dependencies if needed:
 python -m pip install -r requirements-api-dev.txt
 ```
 
-Run the API test suite against the existing sample:
+Run the API test suite. It creates a temporary synthetic dataset and does not
+depend on a user-specific temporary directory:
 
 ```powershell
-$env:CYBERFORGE_TEST_DATA_DIR = 'C:\Users\nsrn\AppData\Local\Temp\kilo'
 python -m unittest discover -s tests -p 'test_api.py' -v
 ```
 
-Start one API worker using the sample stores:
+Start one API worker using a complete analytics output directory:
 
 ```powershell
-$env:CYBERFORGE_DATA_DIR = 'C:\Users\nsrn\AppData\Local\Temp\kilo'
+$env:CYBERFORGE_DATA_DIR = 'C:\path\to\data\run-<id>'
 python -m uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 

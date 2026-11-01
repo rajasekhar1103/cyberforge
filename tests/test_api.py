@@ -16,12 +16,206 @@ from api.app import create_app
 from api.config import ApiConfig
 
 
-SAMPLE_DIR = Path(os.environ.get("CYBERFORGE_TEST_DATA_DIR", Path(tempfile.gettempdir()) / "kilo"))
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "docs" / "api-data-contracts.md"
-DETECTIONS_PATH = SAMPLE_DIR / "detections.parquet"
-INCIDENTS_PATH = SAMPLE_DIR / "incidents.parquet"
-RELATIONS_PATH = SAMPLE_DIR / "incident_detections.parquet"
-GRAPH_PATH = SAMPLE_DIR / "graph.json"
+
+
+def _sample_id(index: int) -> str:
+    return f"00000000-0000-4000-8000-{index:012d}"
+
+
+def _write_sample_artifacts(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    detections = []
+    incident_detection_ids: dict[int, list[str]] = {}
+    for index in range(1, 183):
+        incident_index = 1 if index <= 2 else index - 1
+        detection_id = _sample_id(index)
+        incident_detection_ids.setdefault(incident_index, []).append(detection_id)
+        detections.append((
+            detection_id,
+            "RULE-001",
+            "Sample detection",
+            "authentication",
+            "medium",
+            "Synthetic API test evidence",
+            "192.0.2.10",
+            "198.51.100.20",
+            "analyst",
+            "firewall-01",
+            str(1_700_000_000_000_000_000 + index * 100),
+            "2023-11-14",
+            "22:13:20",
+            "UTC",
+            "sample.log",
+            index,
+            json.dumps({"srcip": "192.0.2.10", "user": "analyst"}),
+            "[]",
+            None,
+            '["T1110"]',
+        ))
+
+    incidents = []
+    relationships = []
+    for index, detection_ids in incident_detection_ids.items():
+        incident_id = _sample_id(index)
+        detection_indices = [int(detection_id[-12:]) for detection_id in detection_ids]
+        first_eventtime = str(
+            1_700_000_000_000_000_000 + min(detection_indices) * 100
+        )
+        last_eventtime = str(
+            1_700_000_000_000_000_000 + max(detection_indices) * 100
+        )
+        incidents.append((
+            incident_id,
+            "Observation cluster: authentication",
+            "Synthetic cluster for API tests; not a confirmed incident",
+            "medium",
+            None,
+            first_eventtime,
+            last_eventtime,
+            len(detection_ids),
+            len(detection_ids),
+            '["192.0.2.10"]',
+            '["198.51.100.20"]',
+            '["analyst"]',
+            '["firewall-01"]',
+            json.dumps(detection_ids),
+            '["shared source IP"]' if len(detection_ids) > 1 else '["single detection"]',
+            json.dumps([
+                {"source_file": "sample.log", "line_number": detection_index}
+                for detection_index in detection_indices
+            ]),
+            "open",
+        ))
+        relationships.extend((incident_id, detection_id) for detection_id in detection_ids)
+
+    graph_nodes: dict[str, dict[str, str]] = {}
+    graph_edges = []
+    for index, detection in enumerate(detections, start=1):
+        detection_id = detection[0]
+        incident_id = _sample_id(1 if index <= 2 else index - 1)
+        nodes = (
+            (f"det:{detection_id}", "detection", detection_id),
+            ("ip:192.0.2.10", "ip", "192.0.2.10"),
+            ("ip:198.51.100.20", "ip", "198.51.100.20"),
+            ("user:analyst", "user", "analyst"),
+            ("host:firewall-01", "host", "firewall-01"),
+            ("tech:T1110", "technique", "T1110"),
+            (f"inc:{incident_id}", "incident", incident_id),
+        )
+        graph_nodes.update({
+            node_id: {"id": node_id, "type": node_type, "value": value}
+            for node_id, node_type, value in nodes
+        })
+        graph_edges.extend([
+            {
+                "source": "ip:192.0.2.10",
+                "target": f"det:{detection_id}",
+                "rel": "OBSERVED_SOURCE",
+                "evidence": "sample.log",
+                "line": index,
+                "observed": True,
+            },
+            {
+                "source": f"det:{detection_id}",
+                "target": "ip:198.51.100.20",
+                "rel": "OBSERVED_DESTINATION",
+                "evidence": "sample.log",
+                "line": index,
+                "observed": True,
+            },
+            {
+                "source": f"det:{detection_id}",
+                "target": "user:analyst",
+                "rel": "ASSOCIATED_WITH_USER",
+                "evidence": "sample.log",
+                "line": index,
+                "observed": True,
+            },
+            {
+                "source": f"det:{detection_id}",
+                "target": "host:firewall-01",
+                "rel": "OBSERVED_ON_HOST",
+                "evidence": "sample.log",
+                "line": index,
+                "observed": True,
+            },
+            {
+                "source": f"det:{detection_id}",
+                "target": "tech:T1110",
+                "rel": "MAPPED_TO_TECHNIQUE",
+                "evidence": "sample.log",
+                "line": index,
+                "observed": False,
+            },
+            {
+                "source": f"det:{detection_id}",
+                "target": f"inc:{incident_id}",
+                "rel": "RELATED_TO_INCIDENT",
+                "evidence": f"detection_id={detection_id};incident_id={incident_id}",
+                "line": None,
+                "observed": False,
+            },
+        ])
+
+    with duckdb.connect() as connection:
+        connection.execute("""
+            CREATE TABLE detections (
+                detection_id VARCHAR, rule_id VARCHAR, rule_name VARCHAR,
+                category VARCHAR, severity VARCHAR, description VARCHAR,
+                srcip VARCHAR, dstip VARCHAR, username VARCHAR, host VARCHAR,
+                eventtime VARCHAR, date VARCHAR, time VARCHAR, tz VARCHAR,
+                source_file VARCHAR, line_number BIGINT, evidence VARCHAR,
+                matched_conditions VARCHAR, confidence VARCHAR,
+                mitre_techniques VARCHAR
+            )
+        """)
+        connection.executemany(
+            "INSERT INTO detections VALUES (" + ",".join(["?"] * 20) + ")",
+            detections,
+        )
+        connection.execute("""
+            CREATE TABLE incidents (
+                incident_id VARCHAR, title VARCHAR, description VARCHAR,
+                severity VARCHAR, confidence VARCHAR, first_observed VARCHAR,
+                last_observed VARCHAR, detection_count BIGINT,
+                unique_source_events BIGINT, related_srcips VARCHAR,
+                related_dstips VARCHAR, related_usernames VARCHAR,
+                related_hosts VARCHAR, detection_ids VARCHAR,
+                correlation_reasons VARCHAR, evidence_refs VARCHAR, status VARCHAR
+            )
+        """)
+        connection.executemany(
+            "INSERT INTO incidents VALUES (" + ",".join(["?"] * 17) + ")",
+            incidents,
+        )
+        connection.execute("""
+            CREATE TABLE incident_detections (
+                incident_id VARCHAR, detection_id VARCHAR
+            )
+        """)
+        connection.executemany(
+            "INSERT INTO incident_detections VALUES (?, ?)",
+            relationships,
+        )
+        for table, filename in (
+            ("detections", "detections.parquet"),
+            ("incidents", "incidents.parquet"),
+            ("incident_detections", "incident_detections.parquet"),
+        ):
+            path = str(directory / filename).replace("'", "''")
+            connection.execute(f"COPY {table} TO '{path}' (FORMAT PARQUET)")
+
+    (directory / "graph.json").write_text(
+        json.dumps({
+            "directed": True,
+            "multigraph": False,
+            "graph": {},
+            "nodes": list(graph_nodes.values()),
+            "edges": graph_edges,
+        }),
+        encoding="utf-8",
+    )
 
 
 def _read_contract_schema() -> dict[str, Any]:
@@ -37,7 +231,28 @@ def _read_contract_schema() -> dict[str, Any]:
 class InvestigationApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        missing = [path for path in (DETECTIONS_PATH, INCIDENTS_PATH, RELATIONS_PATH, GRAPH_PATH) if not path.is_file()]
+        configured_directory = os.environ.get("CYBERFORGE_TEST_DATA_DIR")
+        cls._temporary_data = None
+        if configured_directory:
+            cls.sample_dir = Path(configured_directory)
+        else:
+            cls._temporary_data = tempfile.TemporaryDirectory(prefix="cyberforge-api-test-")
+            cls.sample_dir = Path(cls._temporary_data.name)
+            _write_sample_artifacts(cls.sample_dir)
+
+        cls.detections_path = cls.sample_dir / "detections.parquet"
+        cls.incidents_path = cls.sample_dir / "incidents.parquet"
+        cls.relations_path = cls.sample_dir / "incident_detections.parquet"
+        cls.graph_path = cls.sample_dir / "graph.json"
+        missing = [
+            path for path in (
+                cls.detections_path,
+                cls.incidents_path,
+                cls.relations_path,
+                cls.graph_path,
+            )
+            if not path.is_file()
+        ]
         if missing:
             raise RuntimeError(f"Functional sample artifacts are unavailable: {missing}")
         connection = duckdb.connect()
@@ -56,14 +271,14 @@ class InvestigationApiTests(unittest.TestCase):
             ORDER BY r.incident_id
             LIMIT 1
             """,
-            [str(RELATIONS_PATH), str(RELATIONS_PATH)],
+            [str(cls.relations_path), str(cls.relations_path)],
         ).fetchone()
         cls.contract_schema = _read_contract_schema()
         cls.config = ApiConfig(
-            detections_path=DETECTIONS_PATH,
-            incidents_path=INCIDENTS_PATH,
-            incident_detections_path=RELATIONS_PATH,
-            graph_path=GRAPH_PATH,
+            detections_path=cls.detections_path,
+            incidents_path=cls.incidents_path,
+            incident_detections_path=cls.relations_path,
+            graph_path=cls.graph_path,
             duckdb_memory_limit="128MB",
             duckdb_temp_directory=Path(tempfile.gettempdir()) / "cyberforge-api-test-temp",
         )
@@ -74,6 +289,8 @@ class InvestigationApiTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.client.__exit__(None, None, None)
+        if cls._temporary_data is not None:
+            cls._temporary_data.cleanup()
 
     def assert_contract(self, response: Any, definition: str) -> None:
         self.assertEqual(response.status_code, 200, response.text)
@@ -128,7 +345,7 @@ class InvestigationApiTests(unittest.TestCase):
         with duckdb.connect() as connection:
             detection = connection.execute(
                 "SELECT srcip, username, severity FROM read_parquet(?) WHERE detection_id = ?",
-                [str(DETECTIONS_PATH), self.detection_id],
+                [str(self.detections_path), self.detection_id],
             ).fetchone()
         filtered = self.client.get(
             "/api/incidents",
@@ -166,7 +383,7 @@ class InvestigationApiTests(unittest.TestCase):
             400,
             "invalid_parameter",
         )
-        absent = "00000000-0000-4000-8000-000000000001"
+        absent = _sample_id(999_999)
         self.assert_error(self.client.get(f"/api/incidents/{absent}"), 404, "not_found")
         self.assert_error(self.client.get(f"/api/detections/{absent}"), 404, "not_found")
 
@@ -178,7 +395,7 @@ class InvestigationApiTests(unittest.TestCase):
                 GROUP BY incident_id HAVING count(*) > 1
                 ORDER BY incident_id LIMIT 1
                 """,
-                [str(RELATIONS_PATH)],
+                [str(self.relations_path)],
             ).fetchone()[0]
             expected = connection.execute(
                 """
@@ -188,7 +405,7 @@ class InvestigationApiTests(unittest.TestCase):
                 WHERE r.incident_id = ?
                 ORDER BY TRY_CAST(d.eventtime AS HUGEINT) ASC NULLS LAST, d.detection_id ASC
                 """,
-                [str(RELATIONS_PATH), str(DETECTIONS_PATH), incident_id],
+                [str(self.relations_path), str(self.detections_path), incident_id],
             ).fetchall()
         response = self.client.get(f"/api/incidents/{incident_id}/timeline")
         self.assert_contract(response, "TimelineResponse")
@@ -244,10 +461,10 @@ class InvestigationApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
             missing_config = ApiConfig(
-                detections_path=DETECTIONS_PATH,
+                detections_path=self.detections_path,
                 incidents_path=temp / "missing.parquet",
-                incident_detections_path=RELATIONS_PATH,
-                graph_path=GRAPH_PATH,
+                incident_detections_path=self.relations_path,
+                graph_path=self.graph_path,
                 duckdb_temp_directory=temp / "duckdb-temp",
             )
             with TestClient(create_app(missing_config)) as client:
@@ -258,19 +475,19 @@ class InvestigationApiTests(unittest.TestCase):
             unreadable = temp / "unreadable.parquet"
             unreadable.write_text("not a parquet file", encoding="utf-8")
             unreadable_config = ApiConfig(
-                detections_path=DETECTIONS_PATH,
+                detections_path=self.detections_path,
                 incidents_path=unreadable,
-                incident_detections_path=RELATIONS_PATH,
-                graph_path=GRAPH_PATH,
+                incident_detections_path=self.relations_path,
+                graph_path=self.graph_path,
                 duckdb_temp_directory=temp / "duckdb-temp-2",
             )
             with TestClient(create_app(unreadable_config)) as client:
                 self.assert_error(client.get("/api/health"), 503, "service_unavailable")
 
             missing_graph_config = ApiConfig(
-                detections_path=DETECTIONS_PATH,
-                incidents_path=INCIDENTS_PATH,
-                incident_detections_path=RELATIONS_PATH,
+                detections_path=self.detections_path,
+                incidents_path=self.incidents_path,
+                incident_detections_path=self.relations_path,
                 graph_path=temp / "missing-graph.json",
                 duckdb_temp_directory=temp / "duckdb-temp-3",
             )
@@ -293,16 +510,21 @@ class InvestigationApiTests(unittest.TestCase):
                     COPY (
                         SELECT incident_id, detection_id FROM read_parquet(?)
                         UNION ALL
-                        SELECT ?, '00000000-0000-4000-8000-000000000099'
+                        SELECT ?, ?
                     ) TO ? (FORMAT PARQUET)
                     """,
-                    [str(RELATIONS_PATH), self.incident_id, str(relation_copy)],
+                    [
+                        str(self.relations_path),
+                        self.incident_id,
+                        _sample_id(999_999),
+                        str(relation_copy),
+                    ],
                 )
             broken_config = ApiConfig(
-                detections_path=DETECTIONS_PATH,
-                incidents_path=INCIDENTS_PATH,
+                detections_path=self.detections_path,
+                incidents_path=self.incidents_path,
                 incident_detections_path=relation_copy,
-                graph_path=GRAPH_PATH,
+                graph_path=self.graph_path,
                 duckdb_temp_directory=Path(temporary) / "duckdb-temp",
             )
             with TestClient(create_app(broken_config)) as client:
@@ -312,7 +534,7 @@ class InvestigationApiTests(unittest.TestCase):
     def test_graph_dangling_endpoint_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             graph_copy = Path(temporary) / "dangling-graph.json"
-            graph = json.loads(GRAPH_PATH.read_text(encoding="utf-8"))
+            graph = json.loads(self.graph_path.read_text(encoding="utf-8"))
             detection_node = f"det:{self.detection_id}"
             matching_edge = next(
                 edge
@@ -325,9 +547,9 @@ class InvestigationApiTests(unittest.TestCase):
                 matching_edge["source"] = "missing:node"
             graph_copy.write_text(json.dumps(graph), encoding="utf-8")
             broken_graph_config = ApiConfig(
-                detections_path=DETECTIONS_PATH,
-                incidents_path=INCIDENTS_PATH,
-                incident_detections_path=RELATIONS_PATH,
+                detections_path=self.detections_path,
+                incidents_path=self.incidents_path,
+                incident_detections_path=self.relations_path,
                 graph_path=graph_copy,
                 duckdb_temp_directory=Path(temporary) / "duckdb-temp",
             )

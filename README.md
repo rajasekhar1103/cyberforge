@@ -39,16 +39,24 @@ observation clusters, and provides dashboards for exploring the results.
 
 ## Requirements
 
-- Windows PowerShell examples below assume the repository root is the current
-  directory.
+- The commands support desktop Windows (PowerShell) and macOS/Linux (Bash); they
+  are not mobile-device instructions. Start commands from the repository root.
 - Rust stable with Cargo, for the parser.
 - Python 3.10 or newer and pip.
-- Disk space for input logs, Parquet outputs, and DuckDB temporary files. The
-  supplied `firex-10G.log` is about 5.35 GB; the parsed Parquet file is also large.
+- A FortiGate log file. `firex-10G.log` is not tracked by Git (the repository
+  ignores `*.log`), so provide that file separately or set the input path to your
+  own log.
+- Free disk space for the input, parsed Parquet, detections, correlation outputs,
+  and DuckDB temporary files. The example 5.35 GB log requires substantially more
+  than 5.35 GB of free space to process; there is no universal minimum because
+  output and spill sizes depend on the input. The graph builder also loads its
+  inputs into memory.
+- The dashboards bind to `127.0.0.1` in these examples and are reachable from the
+  same machine only.
 
 ### Set up Python and Rust
 
-From the repository root:
+From the repository root in Windows PowerShell:
 
 ```powershell
 py -m venv .venv
@@ -62,25 +70,51 @@ If PowerShell blocks virtual-environment activation, either adjust the local
 execution policy according to your organization's guidance or run the environment's
 Python directly at `.venv\Scripts\python.exe`.
 
+On macOS or Linux, use Bash:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-api-dev.txt -r requirements-dashboard.txt pyarrow PyYAML networkx requests
+cargo build --release --manifest-path cyberforge-parser/Cargo.toml
+```
+
 ## Run the pipeline
 
-The following commands use the included `firex-10G.log` and keep generated files in
-an untracked `data\run` directory. They do not overwrite existing outputs without
-confirmation.
-
-```powershell
-New-Item -ItemType Directory -Force .\data\run | Out-Null
-$InputLog = (Resolve-Path .\firex-10G.log).Path
-$Events = (Join-Path (Resolve-Path .\data\run).Path 'firex-events.parquet')
-$Detections = (Join-Path (Resolve-Path .\data\run).Path 'detections.parquet')
-```
+Run from the repository root in one PowerShell window. Run each numbered block in
+order in that same window; later steps use variables created in step 1.
+`firex-10G.log` is not included in Git, so change `$InputLogPath` to the path of a
+FortiGate log you have provided. Each run creates a new output directory rather
+than replacing previous results. By default, output is stored under the repository's
+`data` folder. If that drive does not have enough free space, set
+`$env:CYBERFORGE_OUTPUT_DIR` to a folder on a drive with enough free space before
+running step 1; for example, `D:\CyberForge\data`.
 
 ### 1. Parse the log
 
 ```powershell
+$InputLogPath = '.\firex-10G.log'
+if (-not (Test-Path -LiteralPath $InputLogPath -PathType Leaf)) {
+  throw "Log file not found: $InputLogPath"
+}
+$InputLog = (Resolve-Path -LiteralPath $InputLogPath).Path
+$RunRoot = if ($env:CYBERFORGE_OUTPUT_DIR) {
+  $env:CYBERFORGE_OUTPUT_DIR
+} else {
+  Join-Path (Get-Location).Path 'data'
+}
+New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
+$RunDirectory = Join-Path $RunRoot ("run-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $RunDirectory -ErrorAction Stop | Out-Null
+$Events = Join-Path $RunDirectory 'firex-events.parquet'
+$Detections = Join-Path $RunDirectory 'detections.parquet'
+Write-Host "Writing outputs to $RunDirectory"
+
 cargo run --release --manifest-path .\cyberforge-parser\Cargo.toml -- `
   --input $InputLog `
   --output $Events
+if ($LASTEXITCODE -ne 0) { throw 'Log parsing failed' }
 ```
 
 The parser defaults to batches of 1,000 records and two worker threads. Tune with
@@ -96,22 +130,45 @@ cargo run --release --manifest-path .\cyberforge-parser\Cargo.toml -- `
 
 ### 2. Run detection
 
+This reads the parsed events and YAML rules, then writes matching observations to
+`detections.parquet`.
+
 ```powershell
+if (-not (Test-Path -LiteralPath $Events -PathType Leaf)) {
+  throw "Parsed events not found: $Events. Run step 1 first."
+}
+
 python .\detection-engine\engine.py `
   --input $Events `
   --rules .\detection-engine\rules\detections.yaml `
   --output $Detections
+if ($LASTEXITCODE -ne 0) { throw 'Detection failed' }
+if (-not (Test-Path -LiteralPath $Detections -PathType Leaf)) {
+  throw "Detection output was not created: $Detections"
+}
+Write-Host "Detections written to $Detections"
 ```
 
 The detector defaults to 5,000-row batches. It prints progress and a final summary.
 To disable PyArrow's parallel Parquet decoding, add `--sequential-read`.
 
-### 3. (Optional) Correlate detections
+### 3. Correlate detections (required before building a graph)
+
+This groups detections into time-related observation clusters. It creates the
+incident and detection-to-cluster Parquet files needed by the graph and
+investigation dashboard. Run this step before step 4 and before starting the
+investigation dashboard/API. It is optional only if you are using the direct
+detection dashboard and do not need a graph. Correlation does not prove causation
+or compromise.
 
 ```powershell
-$Incidents = Join-Path (Resolve-Path .\data\run).Path 'incidents.parquet'
-$Relations = Join-Path (Resolve-Path .\data\run).Path 'incident_detections.parquet'
-$Temp = Join-Path $env:TEMP 'cyberforge-correlation'
+if (-not (Test-Path -LiteralPath $Detections -PathType Leaf)) {
+  throw "Detections not found: $Detections. Run step 2 first."
+}
+
+$Incidents = Join-Path $RunDirectory 'incidents.parquet'
+$Relations = Join-Path $RunDirectory 'incident_detections.parquet'
+$Temp = Join-Path $env:TEMP ("cyberforge-correlation-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $Temp | Out-Null
 
 python .\correlation-engine\correlate.py `
@@ -121,36 +178,120 @@ python .\correlation-engine\correlate.py `
   --window 3600000000000 `
   --memory-limit 512MB `
   --temp-directory $Temp
+if ($LASTEXITCODE -ne 0) { throw 'Correlation failed' }
+foreach ($Path in @($Incidents, $Relations)) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "Correlation output was not created: $Path"
+  }
+}
+Write-Host "Observation clusters written to $Incidents"
+Write-Host "Cluster links written to $Relations"
 ```
 
 The default correlation window is one hour in the nanosecond units used by
 FortiGate `eventtime`. Correlation indicates shared-source temporal proximity; it
 does not establish causality or a confirmed attack path.
 
-### 4. (Optional) Build a graph
+### 4. Build a graph (optional)
+
+This creates a JSON graph from the detection and correlation outputs. The graph
+builder loads its input into memory, so start with a small log if your machine has
+limited RAM.
 
 ```powershell
-$Graph = Join-Path (Resolve-Path .\data\run).Path 'graph.json'
+if ([string]::IsNullOrWhiteSpace($Detections)) {
+  throw 'Detections path is not set. Run step 2 first, or set $Detections to your detections.parquet path.'
+}
+if (-not (Test-Path -LiteralPath $Detections -PathType Leaf)) {
+  throw "Detections not found: $Detections. Run step 2 first."
+}
+
+$RunDirectory = Split-Path -Parent $Detections
+$Incidents = Join-Path $RunDirectory 'incidents.parquet'
+$Relations = Join-Path $RunDirectory 'incident_detections.parquet'
+foreach ($Path in @($Incidents, $Relations)) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "Required graph input not found: $Path. Run step 3 (correlation) first."
+  }
+}
+
+$Graph = Join-Path $RunDirectory 'graph.json'
 python .\graph-engine\graph.py `
   --detections $Detections `
   --incidents $Incidents `
   --relations $Relations `
   --out $Graph
+if ($LASTEXITCODE -ne 0) { throw 'Graph generation failed' }
+if (-not (Test-Path -LiteralPath $Graph -PathType Leaf)) {
+  throw "Graph output was not created: $Graph"
+}
+Write-Host "Graph written to $Graph"
 ```
 
-The current graph builder materializes its input in memory. Start with a manageable
-dataset and check available RAM before using it on a full large-log output. The API
-also enforces graph size limits; see [API and data contracts](docs/api-data-contracts.md).
+The API also enforces graph size limits; see [API and data contracts](docs/api-data-contracts.md).
+
+### macOS/Linux (Bash)
+
+The following block runs the parser, detector, correlator, and graph builder. Set
+`INPUT_LOG` to the path of a log you have provided. A new output directory is
+created for each run.
+
+```bash
+set -e
+INPUT_LOG="$PWD/firex-10G.log"
+if [ ! -f "$INPUT_LOG" ]; then
+  printf 'Log file not found: %s\n' "$INPUT_LOG" >&2
+  exit 1
+fi
+mkdir -p data
+RUN_DIR="data/run-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir "$RUN_DIR"
+EVENTS="$PWD/$RUN_DIR/firex-events.parquet"
+DETECTIONS="$PWD/$RUN_DIR/detections.parquet"
+INCIDENTS="$PWD/$RUN_DIR/incidents.parquet"
+RELATIONS="$PWD/$RUN_DIR/incident_detections.parquet"
+GRAPH="$PWD/$RUN_DIR/graph.json"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cyberforge-correlation.XXXXXX")"
+printf 'Writing outputs to %s\n' "$RUN_DIR"
+
+cargo run --release --manifest-path cyberforge-parser/Cargo.toml -- \
+  --input "$INPUT_LOG" \
+  --output "$EVENTS"
+
+cargo run --release --manifest-path cyberforge-parser/Cargo.toml -- \
+  --input "$INPUT_LOG" \
+  --scan-timestamps
+
+python detection-engine/engine.py \
+  --input "$EVENTS" \
+  --rules detection-engine/rules/detections.yaml \
+  --output "$DETECTIONS"
+
+python correlation-engine/correlate.py \
+  --detections "$DETECTIONS" \
+  --out-incidents "$INCIDENTS" \
+  --out-rel "$RELATIONS" \
+  --window 3600000000000 \
+  --memory-limit 512MB \
+  --temp-directory "$TEMP_DIR"
+
+python graph-engine/graph.py \
+  --detections "$DETECTIONS" \
+  --incidents "$INCIDENTS" \
+  --relations "$RELATIONS" \
+  --out "$GRAPH"
+```
 
 ## View results
 
 ### Direct detection dashboard
 
 This view needs only the detections Parquet output. In a new PowerShell window from
-the repository root:
+the repository root, set `$RunDirectory` to the path printed by the pipeline:
 
 ```powershell
-$env:CYBERFORGE_DETECTIONS_PATH = (Resolve-Path .\data\run\detections.parquet).Path
+$RunDirectory = 'C:\path\to\data\run-<id>'
+$env:CYBERFORGE_DETECTIONS_PATH = (Resolve-Path (Join-Path $RunDirectory 'detections.parquet')).Path
 python -m streamlit run .\dashboard\detection_results.py `
   --server.address 127.0.0.1 `
   --server.port 8502
@@ -160,15 +301,27 @@ Open <http://127.0.0.1:8502>. It provides summary charts, filters, paginated
 detections, and an evidence-linked activity-path view. Activity paths are
 visualizations of observations and ordering, not proof of causation.
 
+On macOS or Linux, set the detection path to the run directory printed by the Bash
+pipeline, then start the same view:
+
+```bash
+export CYBERFORGE_DETECTIONS_PATH="$PWD/data/run-<id>/detections.parquet"
+python -m streamlit run dashboard/detection_results.py \
+  --server.address 127.0.0.1 \
+  --server.port 8502
+```
+
 ### Investigation dashboard and API
 
 The investigation dashboard requires all four files in the configured data
 directory: `detections.parquet`, `incidents.parquet`,
 `incident_detections.parquet`, and `graph.json`. After completing the optional
-correlation and graph steps, start the API in one PowerShell window:
+correlation and graph steps, start the API in one PowerShell window. Set
+`$RunDirectory` to the same output directory:
 
 ```powershell
-$env:CYBERFORGE_DATA_DIR = (Resolve-Path .\data\run).Path
+$RunDirectory = 'C:\path\to\data\run-<id>'
+$env:CYBERFORGE_DATA_DIR = (Resolve-Path $RunDirectory).Path
 python -m uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
@@ -184,6 +337,22 @@ python -m streamlit run .\dashboard\app.py `
 Open <http://127.0.0.1:8501>. The API is read-only and binds to localhost in these
 examples. Do not expose it to an untrusted network without adding appropriate
 authentication, authorization, and deployment safeguards.
+
+On macOS or Linux, set the dataset path and start the API:
+
+```bash
+export CYBERFORGE_DATA_DIR="$PWD/data/run-<id>"
+python -m uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+In another terminal:
+
+```bash
+export CYBERFORGE_API_URL='http://127.0.0.1:8000'
+python -m streamlit run dashboard/app.py \
+  --server.address 127.0.0.1 \
+  --server.port 8501
+```
 
 ## Achievements and measured results
 
@@ -286,24 +455,49 @@ Run the focused Rust parser tests:
 
 ```powershell
 cargo test --manifest-path .\cyberforge-parser\Cargo.toml
+if ($LASTEXITCODE -ne 0) { throw 'Rust parser tests failed' }
 ```
 
 Run the focused Python detection and correlation tests:
 
 ```powershell
 Push-Location .\detection-engine
-python -m unittest discover -s tests -p "test_engine_streaming.py"
-Pop-Location
+try {
+  python -m unittest discover -s tests -p "test_engine_streaming.py"
+  if ($LASTEXITCODE -ne 0) { throw 'Detection tests failed' }
+} finally {
+  Pop-Location
+}
 
 Push-Location .\correlation-engine
-python -m unittest discover -s tests -p "test_streaming_correlation.py"
-Pop-Location
+try {
+  python -m unittest discover -s tests -p "test_streaming_correlation.py"
+  if ($LASTEXITCODE -ne 0) { throw 'Correlation tests failed' }
+} finally {
+  Pop-Location
+}
 ```
 
 API tests are in `tests\test_api.py`; run them with:
 
 ```powershell
 python -m unittest discover -s tests -p "test_api.py"
+if ($LASTEXITCODE -ne 0) { throw 'API tests failed' }
+```
+
+The API tests create and clean up their own synthetic Parquet and graph fixtures.
+They do not require a large log or a user-specific temporary directory. The
+detection and correlation test commands change into their component directories so
+their local module imports resolve correctly.
+
+On macOS or Linux, run the same suites with:
+
+```bash
+set -e
+cargo test --manifest-path cyberforge-parser/Cargo.toml
+(cd detection-engine && python -m unittest discover -s tests -p 'test_engine_streaming.py')
+(cd correlation-engine && python -m unittest discover -s tests -p 'test_streaming_correlation.py')
+python -m unittest discover -s tests -p 'test_api.py'
 ```
 
 ## Further documentation
