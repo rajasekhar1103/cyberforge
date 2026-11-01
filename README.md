@@ -200,6 +200,9 @@ rules:
 
 Changes include:
 
+- On identical rules and input, the updated detector emits 37.53% fewer rows and
+  produces a 26.55% smaller Parquet output. This is a measured reduction in output
+  volume, not evidence by itself of faster execution or fewer false alarms.
 - AUTH-001 now requires five failed admin logins from the same source IP within
   600 seconds. Each alert retains references to all five contributing parsed rows.
 - IPS rules are split by source severity, eliminating 177,772 duplicate
@@ -213,9 +216,23 @@ Changes include:
 - The Rust timestamp-only scanner was previously run on the supplied log and reported
   9,125,383 timestamps in about 40.9 seconds.
 
-These are measured runtime/output changes, **not measured accuracy or false-positive
-reductions**. The stricter detector took slightly longer and used slightly more
-sampled peak memory in the full-run comparison. See the
+### Accuracy status
+
+The accuracy work improves evidence quality and makes several rules more specific:
+repeated admin failures are aggregated instead of alerting on every failed login,
+overlapping IPS tiers no longer duplicate alerts, unsupported AV/VPN evidence does
+not produce those labels, and quarantined or malformed rows are not silently treated
+as clean evidence. All 73,695 event references attached to the 14,739 AUTH-001
+aggregates resolved to parsed source rows.
+
+These are rule and data-quality improvements, **not a measured accuracy score**.
+There is no official labeled ground truth in the repository, so precision, recall,
+false-alarm rate, ATT&CK label accuracy, and ordered attack-path success remain
+unmeasured. Do not interpret fewer detections as proof of fewer false positives.
+The stricter detector took slightly longer and used slightly more sampled peak memory
+in the full-run comparison; its measured benefit here is reduced output volume,
+deduplicated IPS observations, and stronger evidence provenance—not a throughput gain.
+See the
 [detection accuracy audit](reports/detection-accuracy-audit.md) for rule counts,
 parser statistics, methodology, and the scoring-data requirements.
 
